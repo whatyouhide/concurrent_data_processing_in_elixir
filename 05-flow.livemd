@@ -1,0 +1,154 @@
+# Flow
+
+```elixir
+Mix.install([
+  {:flow, "~> 1.2"},
+  {:req, "~> 0.3.5"},
+  {:kino, "~> 0.8.1"},
+  {:kino_vega_lite, "~> 0.1.7"},
+  {:nimble_csv, "~> 1.2"}
+])
+
+alias VegaLite, as: VL
+
+defmodule Helpers do
+  def plot_histogram(data, bucket_size) when is_list(data) and is_integer(bucket_size) do
+    unless match?([%{bucket_start: _, bucket_end: _, count: _} | _], data) do
+      raise """
+      the input data must be a list of maps that look like this:
+
+        %{bucket_start: ..., bucket_end: ..., count: ...}
+      """
+    end
+
+    VL.new(height: 300, width: 800)
+    |> VL.mark(:bar)
+    |> VL.encode_field(:x, "bucket_start",
+      title: "USD goal (real)",
+      axis: [label_angle: -50],
+      bin: [binned: true, step: bucket_size]
+    )
+    |> VL.encode_field(:x2, "bucket_end")
+    |> VL.encode_field(:y, "count", title: "Projects", type: :quantitative)
+    |> VL.encode_field(:color, "count", type: :quantitative, scale: [scheme: "teals"])
+    |> VL.data_from_values(data)
+  end
+
+  def timed(title, elem_count, fun) when is_binary(title) and is_function(fun, 0) do
+    {elapsed, result} = :timer.tc(fun)
+    elems_per_s = round(elem_count / elapsed * 1_000_000)
+    IO.puts("#{title} finished in #{div(elapsed, 1000)}ms (#{elems_per_s} rows/s)")
+    result
+  end
+end
+```
+
+## Data Analysis For a Random Kickstarter Dataset
+
+Here's a dataset of Kickstarter data from 2018, taken [from Keggle](https://www.kaggle.com/datasets/kemical/kickstarter-projects).
+
+```elixir
+csv_path = "/data/flow/kickstarter.csv"
+```
+
+It contains these columns:
+
+```elixir
+csv_columns = [
+  "ID",
+  "name",
+  "category",
+  "main_category",
+  "currency",
+  "deadline",
+  "goal",
+  "launched",
+  "pledged",
+  "state",
+  "backers",
+  "country",
+  "usd pledged",
+  "usd_pledged_real",
+  "usd_goal_real"
+]
+```
+
+Let's create a stream of the data in the CSV.
+
+```elixir
+csv_stream =
+  csv_path
+  |> File.stream!()
+  |> NimbleCSV.RFC4180.parse_stream(skip_headers: true)
+  |> Stream.map(&Map.new(Enum.zip(csv_columns, &1)))
+```
+
+## Histogram with Streams
+
+```elixir
+bucket_size = 1_000
+max_dollar = 100_000
+rows_to_examine = 50_000
+
+data_for_histogram =
+  Helpers.timed("Reading CSV", rows_to_examine, fn ->
+    csv_stream
+    |> Stream.take(rows_to_examine)
+    |> Stream.map(&Map.take(&1, ["ID", "usd_goal_real"]))
+    |> Enum.group_by(fn row ->
+      row["usd_goal_real"]
+      |> String.to_float()
+      |> round()
+      |> div(bucket_size)
+      |> Kernel.*(bucket_size)
+    end)
+    |> Stream.map(fn {bucket, elems} ->
+      %{bucket_start: bucket, bucket_end: bucket + bucket_size, count: length(elems)}
+    end)
+    |> Stream.filter(&(&1.bucket_start < max_dollar))
+    |> Enum.to_list()
+  end)
+
+Helpers.plot_histogram(data_for_histogram, bucket_size)
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Histogram with Flow
+
+Naive implementation, mostly replace `Stream` with`Flow`.
+
+```elixir
+bucket_size = 1_000
+max_dollar = 100_000
+rows_to_examine = 50_000
+
+data_for_histogram =
+  Helpers.timed("Reading CSV", rows_to_examine, fn ->
+    csv_stream
+    |> Stream.take(rows_to_examine)
+    |> Flow.from_enumerable()
+    |> Flow.map(&Map.take(&1, ["ID", "usd_goal_real"]))
+    |> Flow.group_by(fn row ->
+      row["usd_goal_real"]
+      |> String.to_float()
+      |> round()
+      |> div(bucket_size)
+      |> Kernel.*(bucket_size)
+    end)
+    |> Flow.partition()
+    |> Flow.map(fn {bucket, elems} ->
+      %{bucket_start: bucket, bucket_end: bucket + bucket_size, count: length(elems)}
+    end)
+    |> Flow.filter(&(&1.bucket_start < max_dollar))
+    |> Enum.to_list()
+  end)
+
+Helpers.plot_histogram(data_for_histogram, bucket_size)
+```
+
+~5x speedup on this machine!
+
+```elixir
+System.schedulers_online()
+```

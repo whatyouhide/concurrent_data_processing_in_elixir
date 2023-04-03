@@ -1,0 +1,201 @@
+# Tasks for Async Computations
+
+```elixir
+Mix.install([
+  {:req, "~> 0.3.5"},
+  {:kino_vega_lite, "~> 0.1"}
+])
+
+defmodule Helpers do
+  alias VegaLite, as: VL
+
+  def instrument(fun) do
+    {elapsed, value} = :timer.tc(fun)
+    IO.puts("Execution took #{round(elapsed / 1000)}ms")
+    value
+  end
+
+  def currency_conversion_url(source_currency, target_currency, date \\ "latest") do
+    "https://cdn.jsdelivr.net/gh/fawazahmed0/currency-api@1/#{date}/currencies/#{source_currency}/#{target_currency}.json"
+  end
+
+  def plot_currencies(data) do
+    values =
+      Enum.map(data, fn {%Date{} = day, currency, value} when is_number(value) ->
+        %{"day" => day, "currency" => currency, "value" => value}
+      end)
+
+    VL.new(width: 500)
+    |> VL.mark(:line, point: true, tooltip: true)
+    |> VL.encode_field(:x, "day", type: :temporal, time_unit: "yearmonthdate")
+    |> VL.encode_field(:y, "value", type: :quantitative, title: "Value for €1")
+    |> VL.encode_field(:color, "currency", type: :nominal, title: "Currency")
+    |> VL.data_from_values(values)
+    |> Kino.VegaLite.new()
+  end
+end
+```
+
+## Async/await
+
+Kind of like **promises**.
+
+<!-- livebook:{"break_markdown":true} -->
+
+```mermaid
+%%{init: {'theme':'forest'}}%%
+
+sequenceDiagram
+  participant P as Main Process
+  participant T as Task
+
+  P ->>+ T: async(function)
+  T ->>- T: compute result
+  T -->> P: result
+  P ->> P: await(task)
+
+  Note left of P: Blocks until there is a result
+```
+
+```elixir
+task =
+  Task.async(fn ->
+    IO.puts("👷‍♀️ Starting intensive task to generate a random number")
+    Process.sleep(3000)
+    Enum.random(1..100)
+  end)
+
+Process.sleep(1000)
+IO.puts("😴 Oops, dozed off in the main process...")
+
+random_number = Task.await(task)
+IO.puts("💡 Here's the random number that the task returned: #{random_number}")
+```
+
+## Computation Bound by Time
+
+```elixir
+weird_task =
+  Task.async(fn ->
+    sleep_time = Enum.random(500..1500)
+    IO.puts("💤 Sleeping for #{sleep_time}ms")
+    Process.sleep(sleep_time)
+    Enum.random([:foo, :bar, :baz])
+  end)
+
+case Task.yield(weird_task, _timeout = 1000) do
+  nil ->
+    case Task.shutdown(weird_task) do
+      {:ok, result} -> result
+      nil -> :timeout
+    end
+
+  {:ok, result} ->
+    result
+end
+```
+
+**Mob programming**: can we refactor this?
+
+## Parallel Mapping
+
+Using [`Task.async_stream/3`](https://hexdocs.pm/elixir/Task.html#async_stream/2).
+
+```elixir
+infinite_stream = Stream.repeatedly(fn -> Enum.random(0..1000) end)
+
+Enum.take(infinite_stream, 5)
+```
+
+```elixir
+parallel_stream =
+  Task.async_stream(infinite_stream, fn timeout ->
+    Process.sleep(timeout)
+    "Slept for #{timeout} ms"
+  end)
+
+start_time = System.system_time(:millisecond)
+
+parallel_stream
+|> Stream.take(5)
+|> Enum.each(fn result ->
+  IO.puts("Task finished with result: #{inspect(result)}")
+end)
+
+IO.puts("Finished in #{System.system_time(:millisecond) - start_time}ms")
+```
+
+Why does this 👆 take so long? 🤔
+
+```elixir
+System.schedulers_online()
+```
+
+```elixir
+parallel_stream =
+  Task.async_stream(
+    infinite_stream,
+    fn timeout ->
+      Process.sleep(timeout)
+      "Slept for #{timeout} ms"
+    end,
+    [raise("missing option")]
+  )
+
+start_time = System.system_time(:millisecond)
+
+parallel_stream
+|> Stream.take(5)
+|> Enum.each(fn result ->
+  IO.puts("Task finished with result: #{inspect(result)}")
+end)
+
+IO.puts("Finished in #{System.system_time(:millisecond) - start_time}ms")
+```
+
+Why does 👆 print all of the things at the same time, and doesn't print the shortest timeouts first?
+
+```elixir
+parallel_stream =
+  Task.async_stream(
+    infinite_stream,
+    fn timeout ->
+      Process.sleep(timeout)
+      "Slept for #{timeout} ms"
+    end,
+    [raise("missing option"), max_concurrency: 3]
+  )
+
+start_time = System.system_time(:millisecond)
+
+parallel_stream
+|> Stream.take(5)
+|> Enum.each(fn result ->
+  IO.puts("Task finished with result: #{inspect(result)}")
+end)
+
+IO.puts("Finished in #{System.system_time(:millisecond) - start_time}ms")
+```
+
+## Real-world Example
+
+Using [an API](https://github.com/fawazahmed0/currency-api#readme) to convert between currencies.
+
+```elixir
+currencies = ["mxn", "gbp", "usd", "czk", "ron", "pln"]
+date_range = Date.range(Date.add(Date.utc_today(), -30), Date.utc_today())
+
+# A stream of (potentially many) {date, currency} tuples.
+stream = Stream.flat_map(currencies, fn currency -> Enum.map(date_range, &{&1, currency}) end)
+
+Helpers.instrument(fn ->
+  fun = fn {date, currency} ->
+    response = Req.get!(Helpers.currency_conversion_url("eur", currency, date))
+    {date, currency, Map.fetch!(response.body, currency)}
+  end
+
+  Task.async_stream(stream, fun, ordered: false, max_concurrency: 20)
+  |> Stream.map(fn {:ok, result} -> result end)
+  |> Helpers.plot_currencies()
+end)
+```

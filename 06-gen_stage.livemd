@@ -1,0 +1,433 @@
+# GenStage
+
+```elixir
+Mix.install([
+  {:gen_stage, "~> 1.0"},
+  {:kino, ">= 0.0.0"},
+  {:phoenix_html, "~> 3.3"},
+  {:req, "~> 0.3.5"},
+  {:floki, "~> 0.34.1"}
+])
+
+defmodule Helpers do
+  def process_name(pid) when is_pid(pid) do
+    case Process.info(pid, :registered_name) do
+      {:registered_name, atom} when is_atom(atom) -> atom
+      _other -> pid
+    end
+  end
+
+  def process_name([:alias | ref]) when is_reference(ref) do
+    :alias
+  end
+
+  def process_name(ref) when is_reference(ref) do
+    :ref
+  end
+end
+
+defmodule GenStageVisualizer do
+  use GenServer
+
+  require Logger
+
+  def start!(opts) when is_list(opts) do
+    producers = Keyword.get(opts, :producers, [])
+    consumers = Keyword.get(opts, :consumers, [])
+
+    try do
+      GenServer.stop(__MODULE__)
+    catch
+      :exit, _ -> :ok
+    end
+
+    case GenServer.start_link(__MODULE__, {producers, consumers}, name: __MODULE__) do
+      {:ok, _pid} -> :ok
+      other -> raise "failed to start visualizer: #{inspect(other)}"
+    end
+  end
+
+  def render do
+    GenServer.call(__MODULE__, :render)
+  end
+
+  defstruct [:producers, :consumers, messages: []]
+
+  @impl true
+  def init({producers, consumers}) do
+    :erlang.trace(:all, true, [:send])
+    {:ok, %__MODULE__{producers: producers, consumers: consumers}}
+  end
+
+  @impl true
+  def handle_info({:trace, from, :send, msg, to}, %__MODULE__{} = state)
+      when node(from) == node() and node(to) == node() and not is_port(from) and not is_port(to) do
+    from_name = Helpers.process_name(from)
+    to_name = Helpers.process_name(to)
+
+    cond do
+      from in state.producers and to in state.consumers ->
+        {:noreply, update_in(state.messages, &(&1 ++ [{from_name, to_name, msg}]))}
+
+      from in state.consumers and to in state.producers ->
+        {:noreply, update_in(state.messages, &(&1 ++ [{from_name, to_name, msg}]))}
+
+      true ->
+        {:noreply, state}
+    end
+  end
+
+  def handle_info(_msg, %__MODULE__{} = state) do
+    {:noreply, state}
+  end
+
+  @impl true
+  def handle_call(:render, _from, state) do
+    if state.messages == [] do
+      raise "no messages, something went wrong"
+    end
+
+    actors =
+      state.messages
+      |> Enum.flat_map(fn {from, to, _msg} -> [from, to] end)
+      |> Enum.uniq()
+      |> Enum.sort()
+      |> Enum.map_join("\n", &~s(  participant #{format_participant(&1)}))
+
+    messages =
+      Enum.map_join(state.messages, "\n", fn {from, to, msg} ->
+        ~s(#{format_participant(from)} ->> #{format_participant(to)}: #{format_message(msg)})
+      end)
+
+    mermaid =
+      Kino.Mermaid.new("""
+      %%{init: {'theme':'forest'}}%%
+
+      sequenceDiagram
+        #{actors}
+        #{messages}
+      """)
+
+    {:reply, mermaid, state}
+  end
+
+  ## Helpers
+
+  defp format_participant(atom) when is_atom(atom), do: inspect(atom)
+  defp format_participant(pid) when is_pid(pid), do: "PID"
+
+  defp format_message({:"$gen_producer", _from, {:subscribe, _sub, _opts}}), do: "subscribe"
+  defp format_message({:"$gen_producer", _from, {:ask, demand}}), do: "ask(#{demand})"
+  defp format_message({:"$gen_consumer", _sub, events}), do: "#{length(events)} events"
+end
+```
+
+## Producers and Consumers
+
+```elixir
+# A producer that emits consecutive integers.
+defmodule NumbersProducer do
+  use GenStage
+
+  def start(opts) do
+    start_at = Keyword.fetch!(opts, :start_at)
+    GenStage.start(__MODULE__, start_at, name: opts[:name] || __MODULE__)
+  end
+
+  @impl true
+  def init(counter) do
+    {:producer, counter}
+  end
+
+  @impl true
+  def handle_demand(demand, counter) when demand > 0 do
+    # If the counter is 3 and we ask for 2 items, we will
+    # emit the items 3 and 4, and set the state to 5.
+    events = Enum.to_list(counter..(counter + demand - 1))
+    {:noreply, events, counter + demand}
+  end
+end
+
+# A consumer that prints the events it consumes. 
+defmodule EventsPrinter do
+  use GenStage
+
+  def start(opts) do
+    name = Keyword.get(opts, :name, __MODULE__)
+    GenStage.start(__MODULE__, name, name: name)
+  end
+
+  @impl true
+  def init(name) do
+    {:consumer, %{name: name}}
+  end
+
+  @impl true
+  def handle_events(events, {consumer, _ref} = _from, state) do
+    # Artificial delay.
+    Process.sleep(500)
+
+    # Inspect the events.
+    IO.inspect(events, label: "Events from #{inspect(consumer)} in #{inspect(state.name)}")
+
+    # We are a consumer, so we would never emit items.
+    {:noreply, [], state}
+  end
+end
+```
+
+Visualizing message flows:
+
+```elixir
+{:ok, consumer} = EventsPrinter.start([])
+{:ok, producer} = NumbersProducer.start(start_at: 489)
+
+GenStageVisualizer.start!(producers: [producer], consumers: [consumer])
+
+# Subscribe the consumer to the producer.
+GenStage.sync_subscribe(consumer, to: producer, min_demand: 2, max_demand: 5)
+
+# Let this run for a couple of seconds.
+Process.sleep(2000)
+
+GenStage.stop(consumer)
+GenStage.stop(producer)
+
+GenStageVisualizer.render()
+```
+
+## Multiple Producers and Consumers
+
+```elixir
+{:ok, consumer1} = EventsPrinter.start(name: Printer1)
+{:ok, consumer2} = EventsPrinter.start(name: Printer2)
+
+{:ok, producer1} = NumbersProducer.start(start_at: 0, name: StartAt0Producer)
+{:ok, producer2} = NumbersProducer.start(start_at: 1000, name: StartAt1000Producer)
+
+GenStageVisualizer.start!(producers: [producer1, producer2], consumers: [consumer1, consumer2])
+
+# Subscribe the consumers to the producers.
+GenStage.sync_subscribe(consumer1, to: producer1, min_demand: 2, max_demand: 8)
+GenStage.sync_subscribe(consumer1, to: producer2, min_demand: 3, max_demand: 8)
+GenStage.sync_subscribe(consumer2, to: producer1, min_demand: 0, max_demand: 1)
+GenStage.sync_subscribe(consumer2, to: producer2, min_demand: 2, max_demand: 8)
+
+GenStage.stop(consumer1)
+GenStage.stop(consumer2)
+GenStage.stop(producer1)
+GenStage.stop(producer2)
+
+GenStageVisualizer.render()
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Dispatchers
+
+Broadcasting to all consumers with `GenStage.BroadcastDispatcher`:
+
+```elixir
+defmodule PubSubProducer do
+  use GenStage
+
+  def start_link do
+    GenStage.start_link(__MODULE__, :no_args, name: __MODULE__)
+  end
+
+  def publish(message) do
+    GenStage.call(__MODULE__, {:publish, message})
+  end
+
+  ## Callbacks
+
+  @impl true
+  def init(:no_args) do
+    {:producer, :no_state, dispatcher: GenStage.BroadcastDispatcher}
+  end
+
+  @impl true
+  def handle_call({:publish, message}, _from, state) do
+    {:reply, :ok, [message], state}
+  end
+
+  @impl true
+  def handle_demand(_demand, state) do
+    {:noreply, [], state}
+  end
+end
+
+{:ok, consumer1} = EventsPrinter.start(name: PubSubPrinter1)
+{:ok, consumer2} = EventsPrinter.start(name: PubSubPrinter2)
+{:ok, consumer3} = EventsPrinter.start(name: PubSubPrinter3)
+
+{:ok, pubsub} = PubSubProducer.start_link()
+
+GenStageVisualizer.start!(producers: [pubsub], consumers: [consumer1, consumer2, consumer3])
+
+# Subscribe the consumers to the producers.
+GenStage.sync_subscribe(consumer1, to: pubsub, min_demand: 2, max_demand: 8)
+GenStage.sync_subscribe(consumer2, to: pubsub, min_demand: 2, max_demand: 8)
+GenStage.sync_subscribe(consumer3, to: pubsub, min_demand: 2, max_demand: 8)
+
+# Publish some messages.
+PubSubProducer.publish("hello")
+PubSubProducer.publish("world")
+
+GenStage.stop(PubSubPrinter1)
+GenStage.stop(PubSubPrinter2)
+GenStage.stop(PubSubPrinter3)
+GenStage.stop(PubSubProducer)
+
+GenStageVisualizer.render()
+```
+
+Dispatching events based on partitions with `GenStage.PartitionDispatcher`:
+
+```elixir
+defmodule TypesProducer do
+  use GenStage
+
+  def start_link do
+    GenStage.start_link(__MODULE__, :no_args, name: __MODULE__)
+  end
+
+  ## Callbacks
+
+  @impl true
+  def init(:no_args) do
+    dispatcher =
+      {GenStage.PartitionDispatcher, partitions: [:binaries, :floats, :integers], hash: &hash/1}
+
+    {:producer, :no_state, dispatcher: dispatcher}
+  end
+
+  @impl true
+  def handle_demand(demand, state) do
+    stream =
+      Stream.repeatedly(fn ->
+        Enum.random([
+          System.unique_integer(),
+          :crypto.strong_rand_bytes(4),
+          System.unique_integer() / 3.14
+        ])
+      end)
+
+    {:noreply, Enum.take(stream, demand), state}
+  end
+
+  defp hash(string) when is_binary(string), do: {string, :binaries}
+  defp hash(float) when is_float(float), do: {float, :floats}
+  defp hash(int) when is_integer(int), do: {int, :integers}
+end
+
+{:ok, binary_consumer} = EventsPrinter.start(name: BinaryPrinter)
+{:ok, float_consumer} = EventsPrinter.start(name: FloatPrinter)
+{:ok, integer_consumer} = EventsPrinter.start(name: IntegerPrinter)
+
+{:ok, producer} = TypesProducer.start_link()
+
+# Subscribe the consumers to the producers.
+subscribe_opts = [to: producer, min_demand: 2, max_demand: 5]
+GenStage.sync_subscribe(binary_consumer, [partition: :binaries] ++ subscribe_opts)
+GenStage.sync_subscribe(float_consumer, [partition: :floats] ++ subscribe_opts)
+GenStage.sync_subscribe(integer_consumer, [partition: :integers] ++ subscribe_opts)
+
+GenStage.stop(BinaryPrinter)
+GenStage.stop(FloatPrinter)
+GenStage.stop(IntegerPrinter)
+GenStage.stop(TypesProducer)
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Use Case: Rate-limited Web Scraper
+
+```elixir
+defmodule RateLimiter do
+  use GenStage
+
+  def start_link do
+    GenStage.start_link(__MODULE__, :no_state)
+  end
+
+  defstruct events: [], emitted_in_interval: 0, max_in_interval: 5
+
+  @impl true
+  def init(:no_state) do
+    :timer.send_interval(1000, self(), :reset_interval)
+    {:producer_consumer, %__MODULE__{}}
+  end
+
+  @impl true
+  def handle_events(events, _from, state) do
+    state = update_in(state.events, &(&1 ++ events))
+    {events_to_emit, state} = get_events_to_emit(state)
+    {:noreply, events_to_emit, state}
+  end
+
+  @impl true
+  def handle_info(:reset_interval, state) do
+    state = %__MODULE__{state | emitted_in_interval: 0, max_in_interval: 5}
+    {events_to_emit, state} = get_events_to_emit(state)
+    {:noreply, events_to_emit, state}
+  end
+
+  defp get_events_to_emit(state) do
+    to_emit = state.max_in_interval - state.emitted_in_interval
+
+    if to_emit > 0 do
+      {events, state} = get_and_update_in(state.events, &Enum.split(&1, to_emit))
+      {events, update_in(state.emitted_in_interval, &(&1 + to_emit))}
+    else
+      {[], state}
+    end
+  end
+end
+
+defmodule Fetcher do
+  use GenStage
+
+  def start_link do
+    GenStage.start_link(__MODULE__, :no_state)
+  end
+
+  @impl true
+  def init(:no_state) do
+    {:producer_consumer, :no_state}
+  end
+
+  @impl true
+  def handle_events(events, _from, state) do
+    events =
+      Enum.flat_map(events, fn year ->
+        response = Req.get!("http://www.planecrashinfo.com/#{year}/#{year}.htm")
+        html_doc = Floki.parse_document!(response.body)
+
+        {[header], table_rows} =
+          html_doc
+          |> Floki.find("table tr")
+          |> Enum.map(fn {"tr", _attrs, data} -> Enum.map(data, &Floki.text/1) end)
+          |> Enum.split(1)
+
+        Enum.map(table_rows, fn row -> Map.new(Enum.zip(header, row)) end)
+      end)
+
+    {:noreply, events, state}
+  end
+end
+
+{:ok, years_producer} = GenStage.from_enumerable(1920..2023)
+{:ok, rate_limiter} = RateLimiter.start_link()
+{:ok, fetcher} = Fetcher.start_link()
+{:ok, events_printer} = EventsPrinter.start(name: CrashesPrinter)
+
+GenStageVisualizer.start!(
+  producers: [years_producer, rate_limiter, fetcher],
+  consumers: [rate_limiter, fetcher, events_printer]
+)
+
+GenStage.sync_subscribe(events_printer, to: fetcher, max_demand: 10)
+GenStage.sync_subscribe(fetcher, to: rate_limiter, max_demand: 10)
+GenStage.sync_subscribe(rate_limiter, to: years_producer, max_demand: 10, cancel: :transient)
+```
