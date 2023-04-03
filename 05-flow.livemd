@@ -45,67 +45,116 @@ end
 
 ## Data Analysis For a Random Kickstarter Dataset
 
-Here's a dataset of Kickstarter data from 2018, taken [from Keggle](https://www.kaggle.com/datasets/kemical/kickstarter-projects).
+Let's use a dataset of *Kickstarter project data*.
+
+Initially taken [from Keggle](https://www.kaggle.com/datasets/kemical/kickstarter-projects), then massaged to make the file bigger and obfuscate the real data.
 
 ```elixir
-csv_path = "/data/flow/kickstarter.csv"
+csv_paths =
+  "./datasets/kickstarter-*.csv"
+  |> Path.absname(__DIR__)
+  |> Path.wildcard()
+
+if csv_paths == [] do
+  raise "files not found for the given pattern"
+end
+
+csv_paths
 ```
 
 It contains these columns:
 
 ```elixir
-csv_columns = [
-  "ID",
-  "name",
-  "category",
-  "main_category",
-  "currency",
-  "deadline",
-  "goal",
-  "launched",
-  "pledged",
-  "state",
-  "backers",
-  "country",
-  "usd pledged",
-  "usd_pledged_real",
-  "usd_goal_real"
-]
+csv_columns =
+  csv_paths
+  |> Enum.at(0)
+  |> File.stream!()
+  |> NimbleCSV.RFC4180.parse_stream(skip_headers: false)
+  |> Enum.at(0)
 ```
 
-Let's create a stream of the data in the CSV.
+The total number of rows is this:
 
 ```elixir
-csv_stream =
-  csv_path
-  |> File.stream!()
-  |> NimbleCSV.RFC4180.parse_stream(skip_headers: true)
-  |> Stream.map(&Map.new(Enum.zip(csv_columns, &1)))
+row_count =
+  csv_paths
+  |> Enum.map(fn file ->
+    file |> File.stream!() |> Enum.count()
+  end)
+  |> Enum.sum()
+```
+
+A few sample rows:
+
+```elixir
+csv_paths
+|> Enum.at(0)
+|> File.stream!()
+|> Enum.take_random(3)
 ```
 
 ## Histogram with Streams
 
+Starting solution that does this:
+
+1. Stream all files, concatenated
+2. "Bucket" the `goal` field based on the `bucket_size`
+3. Skip projects with a USD goal above USD$100,000.000
+4. Return "bucket rows"
+
+A bucket row looks like this:
+
+<!-- livebook:{"force_markdown":true} -->
+
+```elixir
+%{bucket_start: 2000, bucket_end: 3000, count: 13}
+```
+
+<!-- livebook:{"break_markdown":true} -->
+
+<!-- Learn more at https://mermaid-js.github.io/mermaid -->
+
+```mermaid
+%%{init: {'theme':'forest'}}%%
+flowchart TD
+  files[Files]
+  rows_stream[Concat streams]
+  map_csv_parse[Parse each row as CSV]
+  map_bucket_start[Find the bucket for each row]
+  filter_max_dollars[Filter out projects with a goal above $100k]
+  reduce_count[Count projects in each bucket]
+  map_to_histogram[Format for plotting histogram]
+  convert_to_list_and_plot([Convert to list and plot])
+
+  files
+  --> rows_stream
+  --> map_csv_parse
+  --> map_bucket_start
+  --> filter_max_dollars
+  --> reduce_count
+  --> map_to_histogram
+  -.-> convert_to_list_and_plot
+```
+
 ```elixir
 bucket_size = 1_000
 max_dollar = 100_000
-rows_to_examine = 50_000
 
 data_for_histogram =
-  Helpers.timed("Reading CSV", rows_to_examine, fn ->
-    csv_stream
-    |> Stream.take(rows_to_examine)
-    |> Stream.map(&Map.take(&1, ["ID", "usd_goal_real"]))
-    |> Enum.group_by(fn row ->
-      row["usd_goal_real"]
-      |> String.to_float()
-      |> round()
-      |> div(bucket_size)
-      |> Kernel.*(bucket_size)
+  Helpers.timed("Reading CSVs", row_count, fn ->
+    csv_paths
+    |> Stream.map(fn file -> file |> File.stream!() |> Stream.drop(1) end)
+    |> Stream.concat()
+    |> NimbleCSV.RFC4180.parse_stream(skip_headers: true)
+    |> Stream.map(fn [_id, _name, _pledged, goal] ->
+      if :rand.uniform() < 0.01, do: Process.sleep(1)
+      _bucket_start = div(round(String.to_float(goal)), bucket_size) * bucket_size
     end)
-    |> Stream.map(fn {bucket, elems} ->
-      %{bucket_start: bucket, bucket_end: bucket + bucket_size, count: length(elems)}
+    |> Stream.filter(&(&1 <= max_dollar))
+    |> Enum.reduce(%{}, fn bucket_start, acc -> Map.update(acc, bucket_start, 1, &(&1 + 1)) end)
+    |> Stream.map(fn {bucket, count} ->
+      %{bucket_start: bucket, bucket_end: bucket + bucket_size, count: count}
     end)
-    |> Stream.filter(&(&1.bucket_start < max_dollar))
     |> Enum.to_list()
   end)
 
@@ -116,39 +165,122 @@ Helpers.plot_histogram(data_for_histogram, bucket_size)
 
 ## Histogram with Flow
 
-Naive implementation, mostly replace `Stream` with`Flow`.
+First, how many cores do we have available?
+
+```elixir
+System.schedulers_online()
+```
 
 ```elixir
 bucket_size = 1_000
 max_dollar = 100_000
-rows_to_examine = 50_000
 
 data_for_histogram =
-  Helpers.timed("Reading CSV", rows_to_examine, fn ->
-    csv_stream
-    |> Stream.take(rows_to_examine)
-    |> Flow.from_enumerable()
-    |> Flow.map(&Map.take(&1, ["ID", "usd_goal_real"]))
-    |> Flow.group_by(fn row ->
-      row["usd_goal_real"]
-      |> String.to_float()
-      |> round()
-      |> div(bucket_size)
-      |> Kernel.*(bucket_size)
+  Helpers.timed("Reading CSVs", row_count, fn ->
+    csv_paths
+    |> Enum.map(&(&1 |> File.stream!() |> NimbleCSV.RFC4180.parse_stream(skip_headers: true)))
+    |> Flow.from_enumerables()
+    |> Flow.map(fn [_id, _name, _pledged, goal] ->
+      if :rand.uniform() < 0.01, do: Process.sleep(1)
+      _bucket_start = div(round(String.to_float(goal)), bucket_size) * bucket_size
     end)
+    |> Flow.filter(&(&1 < max_dollar))
     |> Flow.partition()
-    |> Flow.map(fn {bucket, elems} ->
-      %{bucket_start: bucket, bucket_end: bucket + bucket_size, count: length(elems)}
+    |> Flow.reduce(fn -> %{} end, fn bucket_start, acc ->
+      Map.update(acc, bucket_start, 1, &(&1 + 1))
     end)
-    |> Flow.filter(&(&1.bucket_start < max_dollar))
     |> Enum.to_list()
   end)
+
+data_for_histogram =
+  for {bucket_start, count} <- data_for_histogram do
+    %{bucket_start: bucket_start, bucket_end: bucket_start + bucket_size, count: count}
+  end
 
 Helpers.plot_histogram(data_for_histogram, bucket_size)
 ```
 
-~5x speedup on this machine!
+```mermaid
+%%{init: {'theme':'forest'}}%%
+flowchart TD;
+  csv_files[CSV files]
+  convert_to_streams[Convert to CSV streams]
+  from_enumerable[Flow.from_enumerables/2]
+
+  csv_files --> convert_to_streams --> from_enumerable
+  from_enumerable --> map1
+  from_enumerable --> map2
+
+  subgraph stage_1[Flat map stage 1]
+    map1[Flow.map/2]
+    filter1[Flow.filter/2]
+    map1 --> filter1
+  end
+
+  subgraph stage_2[Flat map stage 2]
+    map2[Flow.map/2]
+    filter2[Flow.filter/2]
+    map2 --> filter2
+  end
+
+  filter1 -- 1000,4000,5000 --> reducer1
+  filter1 -- 2000,3000 --> reducer2
+  filter2 -- 1000,5000 --> reducer1
+  filter2 -- 2000,3000 --> reducer2
+
+  subgraph Reducer 1
+    reducer1[Flow.reduce/3 to count occurrences]
+  end
+
+  subgraph Reducer 2
+    reducer2[Flow.reduce/3 to count occurrences]
+  end
+```
+
+## Windows and Triggers
 
 ```elixir
-System.schedulers_online()
+bucket_size = 1_000
+max_dollar = 100_000
+
+window = Flow.Window.trigger_periodically(Flow.Window.global(), 1, :second)
+
+data_for_histogram =
+  Helpers.timed("Reading CSVs", row_count, fn ->
+    csv_paths
+    |> Flow.from_enumerable(stages: System.schedulers_online() * 2, max_demand: 1)
+    |> Flow.flat_map(fn file ->
+      file
+      |> File.stream!()
+      |> NimbleCSV.RFC4180.parse_stream(skip_headers: true)
+      |> Stream.map(fn [_id, _name, _pledged, goal] ->
+        _bucket_start = div(round(String.to_float(goal)), bucket_size) * bucket_size
+      end)
+      |> Stream.filter(&(&1 < max_dollar))
+    end)
+    |> Flow.partition(
+      stages: System.schedulers_online(),
+      max_demand: 1000,
+      window: window
+    )
+    |> Flow.reduce(fn -> %{} end, fn bucket_start, acc ->
+      Map.update(acc, bucket_start, 1, &(&1 + 1))
+    end)
+    |> Flow.on_trigger(fn
+      acc, _partition_index, {:global, :global, :done} ->
+        {Enum.to_list(acc), acc}
+
+      acc, _partition_index, {:global, :global, {:periodically, _, _}} ->
+        IO.inspect(map_size(acc), label: "Processed elements")
+        {[], acc}
+    end)
+    |> Enum.to_list()
+  end)
+
+data_for_histogram =
+  for {bucket_start, count} <- data_for_histogram do
+    %{bucket_start: bucket_start, bucket_end: bucket_start + bucket_size, count: count}
+  end
+
+Helpers.plot_histogram(data_for_histogram, bucket_size)
 ```
