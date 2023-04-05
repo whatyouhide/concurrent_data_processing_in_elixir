@@ -2,34 +2,113 @@
 
 ```elixir
 Mix.install([
-  {:redix, "~> 1.0"},
-  {:broadway, "~> 0.6.0"},
-  {:off_broadway_redis_stream, "~> 0.4.0"}
+  {:broadway, "~> 1.0"},
+  {:req, "~> 0.3"},
+  {:kino, "~> 0.9.0"}
 ])
+
+ExUnit.start(autorun: false)
+
+import ExUnit.Assertions
 ```
 
-## Section
+## Overview
+
+### The Goal
+
+The goal of Broadway is to simplify data processing pipelines by providing the right abstractions
+
+Does anybody know why it's called *Broadway*?
+
+### Broadway Components
+
+These are components that make up a Broadway pipeline:
+
+* Producers
+* Processors
+* Batchers and batch processors
+
+## Simple Pipeline: Producer and Processors
+
+<!-- Learn more at https://mermaid-js.github.io/mermaid -->
+
+```mermaid
+%%{init: {'theme':'forest'}}%%
+flowchart TD
+  subgraph Producers
+    prod1([Producer 1])
+    prod2([Producer 2])
+  end
+
+  subgraph Processors
+    proc1([Processor 1])
+    proc2([Processor 2])
+    proc3([Processor 3])
+  end
+
+  prod1 & prod2 --> proc1 & proc2 & proc3
+```
+
+<!-- livebook:{"break_markdown":true} -->
+
+A Broadway producer is a **GenStage producer** that emits `%Broadway.Message{}`s as events.
+
+Let's start with a producer that producers "synthetic" metrics:
 
 ```elixir
-defmodule RedisPrinterPipeline do
+defmodule SyntheticMetricsProducer do
+  use GenStage
+
+  def start_link(options) do
+    GenStage.start_link(__MODULE__, options)
+  end
+
+  @impl true
+  def init(_options) do
+    {:producer, :no_state}
+  end
+
+  @impl true
+  def handle_demand(demand, state) do
+    events =
+      Stream.repeatedly(fn ->
+        %Broadway.Message{
+          data: %{request_time: (:rand.normal() * 500) |> abs() |> round()},
+          acknowledger: Broadway.NoopAcknowledger.init()
+        }
+      end)
+      |> Enum.take(demand)
+
+    {:noreply, events, state}
+  end
+end
+
+# Test:
+{:ok, producer} = Kino.start_child(SyntheticMetricsProducer)
+
+[{producer, max_demand: 5}]
+|> GenStage.stream()
+|> Enum.take(3)
+|> Enum.each(fn message ->
+  assert is_integer(message.data.request_time)
+end)
+```
+
+Now, let's create a Broadway pipeline that consumes metrics, and for now **logs** the ones where `request_time` is greater than 500ms.
+
+```elixir
+defmodule SlowRequestsPipeline do
   use Broadway
 
-  def start_link do
-    redis_uri = URI.parse(System.fetch_env!("UPSTASH_REDIS_URL"))
-    dbg(redis_uri)
+  require Logger
 
-    producer_opts = [
-      redis_client_opts: [host: redis_uri.hostname],
-      stream: "orders",
-      group: "processor-group",
-      consumer_name: hostname()
-    ]
-
+  def start_link([] = _opts) do
     Broadway.start_link(__MODULE__,
       name: __MODULE__,
       producer: [
-        module: {OffBroadway.Redis.Producer, producer_opts},
-        concurrency: 1
+        module: {SyntheticMetricsProducer, []},
+        concurrency: 1,
+        rate_limiting: [allowed_messages: 10, interval: 1_000]
       ],
       processors: [
         default: [concurrency: 2]
@@ -37,11 +116,34 @@ defmodule RedisPrinterPipeline do
     )
   end
 
-  # The only callback you need to process messages.
   @impl true
   def handle_message(:default, message, _context) do
-    IO.inspect(message, label: "Message in processor #{inspect(self())}")
+    if message.data.request_time >= 500 do
+      Logger.info("Slow request (#{message.data.request_time}ms)")
+    end
+
     message
   end
 end
+```
+
+```elixir
+{:ok, pipeline} =
+  Kino.start_child(Supervisor.child_spec(SlowRequestsPipeline, restart: :temporary))
+
+Process.sleep(2_000)
+
+:ok = Broadway.stop(pipeline, :normal, 500)
+```
+
+Wanna see the topology of a Broadway supervision tree? 😎
+
+```elixir
+{:ok, pipeline} =
+  Kino.start_child(Supervisor.child_spec(SlowRequestsPipeline, restart: :temporary))
+
+# Internal API - DO NOT USE!
+Kino.Process.render_sup_tree(:sys.get_state(pipeline).supervisor_pid, direction: :left_right)
+
+:ok = Broadway.stop(pipeline, :normal, 500)
 ```
