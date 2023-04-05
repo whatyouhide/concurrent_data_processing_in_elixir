@@ -31,49 +31,32 @@ defmodule GenStageVisualizer do
 
   require Logger
 
-  def start!(opts) when is_list(opts) do
-    producers = Keyword.get(opts, :producers, [])
-    consumers = Keyword.get(opts, :consumers, [])
-
-    try do
-      GenServer.stop(__MODULE__)
-    catch
-      :exit, _ -> :ok
-    end
-
-    case GenServer.start_link(__MODULE__, {producers, consumers}, name: __MODULE__) do
-      {:ok, _pid} -> :ok
-      other -> raise "failed to start visualizer: #{inspect(other)}"
-    end
+  def start_link(opts) when is_list(opts) do
+    stages = Keyword.fetch!(opts, :stages)
+    GenServer.start_link(__MODULE__, stages)
   end
 
-  def render do
-    GenServer.call(__MODULE__, :render)
+  def render(server) do
+    GenServer.call(server, :render)
   end
 
-  defstruct [:producers, :consumers, messages: []]
+  defstruct [:stages, messages: []]
 
   @impl true
-  def init({producers, consumers}) do
+  def init(stages) do
     :erlang.trace(:all, true, [:send])
-    {:ok, %__MODULE__{producers: producers, consumers: consumers}}
+    {:ok, %__MODULE__{stages: MapSet.new(stages)}}
   end
 
   @impl true
   def handle_info({:trace, from, :send, msg, to}, %__MODULE__{} = state)
       when node(from) == node() and node(to) == node() and not is_port(from) and not is_port(to) do
-    from_name = Helpers.process_name(from)
-    to_name = Helpers.process_name(to)
-
-    cond do
-      from in state.producers and to in state.consumers ->
-        {:noreply, update_in(state.messages, &(&1 ++ [{from_name, to_name, msg}]))}
-
-      from in state.consumers and to in state.producers ->
-        {:noreply, update_in(state.messages, &(&1 ++ [{from_name, to_name, msg}]))}
-
-      true ->
-        {:noreply, state}
+    if from in state.stages and to in state.stages do
+      from_name = Helpers.process_name(from)
+      to_name = Helpers.process_name(to)
+      {:noreply, update_in(state.messages, &(&1 ++ [{from_name, to_name, msg}]))}
+    else
+      {:noreply, state}
     end
   end
 
@@ -84,7 +67,8 @@ defmodule GenStageVisualizer do
   @impl true
   def handle_call(:render, _from, state) do
     if state.messages == [] do
-      raise "no messages, something went wrong"
+      IO.puts("no messages, something went wrong")
+      exit(:no_messages)
     end
 
     actors =
@@ -119,19 +103,21 @@ defmodule GenStageVisualizer do
   defp format_message({:"$gen_producer", _from, {:subscribe, _sub, _opts}}), do: "subscribe"
   defp format_message({:"$gen_producer", _from, {:ask, demand}}), do: "ask(#{demand})"
   defp format_message({:"$gen_consumer", _sub, events}), do: "#{length(events)} events"
+  defp format_message(other), do: inspect(other)
 end
 ```
 
 ## Producers and Consumers
 
+A producer that emits consecutive integers:
+
 ```elixir
-# A producer that emits consecutive integers.
 defmodule NumbersProducer do
   use GenStage
 
-  def start(opts) do
+  def start_link(opts) do
     start_at = Keyword.fetch!(opts, :start_at)
-    GenStage.start(__MODULE__, start_at, name: opts[:name] || __MODULE__)
+    GenStage.start_link(__MODULE__, start_at, name: opts[:name] || __MODULE__)
   end
 
   @impl true
@@ -147,14 +133,18 @@ defmodule NumbersProducer do
     {:noreply, events, counter + demand}
   end
 end
+```
 
+A consumer that prints the events it consumes:
+
+```elixir
 # A consumer that prints the events it consumes. 
 defmodule EventsPrinter do
   use GenStage
 
-  def start(opts) do
+  def start_link(opts) do
     name = Keyword.get(opts, :name, __MODULE__)
-    GenStage.start(__MODULE__, name, name: name)
+    GenStage.start_link(__MODULE__, name, name: name)
   end
 
   @impl true
@@ -179,10 +169,10 @@ end
 Visualizing message flows:
 
 ```elixir
-{:ok, consumer} = EventsPrinter.start([])
-{:ok, producer} = NumbersProducer.start(start_at: 489)
+{:ok, consumer} = Kino.start_child({EventsPrinter, name: FirstPrinter})
+{:ok, producer} = Kino.start_child({NumbersProducer, start_at: 489, name: FirstProducer})
 
-GenStageVisualizer.start!(producers: [producer], consumers: [consumer])
+{:ok, visualizer} = Kino.start_child({GenStageVisualizer, stages: [producer, consumer]})
 
 # Subscribe the consumer to the producer.
 GenStage.sync_subscribe(consumer, to: producer, min_demand: 2, max_demand: 5)
@@ -190,51 +180,138 @@ GenStage.sync_subscribe(consumer, to: producer, min_demand: 2, max_demand: 5)
 # Let this run for a couple of seconds.
 Process.sleep(2000)
 
-GenStage.stop(consumer)
 GenStage.stop(producer)
 
-GenStageVisualizer.render()
+GenStageVisualizer.render(visualizer)
 ```
+
+Who knows what _**backpressure**_ is?
 
 ## Multiple Producers and Consumers
 
+<!-- Learn more at https://mermaid-js.github.io/mermaid -->
+
+```mermaid
+%%{init: {'theme':'forest'}}%%
+flowchart TD;
+  producer1[Producer]
+  producer2[Producer]
+  consumer1[Consumer]
+  consumer2[Consumer]
+  consumer3[Consumer]
+
+  producer1 --> consumer1
+  producer1 --> consumer2
+  producer1 --> consumer3
+  producer2 --> consumer1
+  producer2 --> consumer2
+  producer2 --> consumer3
+```
+
 ```elixir
-{:ok, consumer1} = EventsPrinter.start(name: Printer1)
-{:ok, consumer2} = EventsPrinter.start(name: Printer2)
+{:ok, consumer1} = Kino.start_child({EventsPrinter, name: Printer1})
+{:ok, consumer2} = Kino.start_child({EventsPrinter, name: Printer2})
 
-{:ok, producer1} = NumbersProducer.start(start_at: 0, name: StartAt0Producer)
-{:ok, producer2} = NumbersProducer.start(start_at: 1000, name: StartAt1000Producer)
+{:ok, producer1} = Kino.start_child({NumbersProducer, start_at: 0, name: StartAt0Producer})
+{:ok, producer2} = Kino.start_child({NumbersProducer, start_at: 1000, name: StartAt1000Producer})
 
-GenStageVisualizer.start!(producers: [producer1, producer2], consumers: [consumer1, consumer2])
+{:ok, visualizer} =
+  Kino.start_child({GenStageVisualizer, stages: [producer1, producer2, consumer1, consumer2]})
 
 # Subscribe the consumers to the producers.
-GenStage.sync_subscribe(consumer1, to: producer1, min_demand: 2, max_demand: 8)
-GenStage.sync_subscribe(consumer1, to: producer2, min_demand: 3, max_demand: 8)
-GenStage.sync_subscribe(consumer2, to: producer1, min_demand: 0, max_demand: 1)
-GenStage.sync_subscribe(consumer2, to: producer2, min_demand: 2, max_demand: 8)
+{:ok, _} = GenStage.sync_subscribe(consumer1, to: producer1, min_demand: 2, max_demand: 8)
+{:ok, _} = GenStage.sync_subscribe(consumer1, to: producer2, min_demand: 3, max_demand: 8)
+{:ok, _} = GenStage.sync_subscribe(consumer2, to: producer1, min_demand: 0, max_demand: 1)
+{:ok, _} = GenStage.sync_subscribe(consumer2, to: producer2, min_demand: 2, max_demand: 8)
 
-GenStage.stop(consumer1)
-GenStage.stop(consumer2)
+Process.sleep(1000)
+
 GenStage.stop(producer1)
 GenStage.stop(producer2)
 
-GenStageVisualizer.render()
+GenStageVisualizer.render(visualizer)
+```
+
+## Producer-consumers In Between
+
+<!-- Learn more at https://mermaid-js.github.io/mermaid -->
+
+```mermaid
+%%{init: {'theme':'forest'}}%%
+flowchart TD;
+  p1[Producer]
+  p2[Producer]
+  pc1[Producer-consumer]
+  opc1[Other producer-consumer]
+  opc2[Other producer-consumer]
+  fpc1[Yet one more producer-consumer]
+  consumer[Consumer]
+
+  p1 & p2 --> pc1 --> opc1 & opc2 --> fpc1 --> consumer
+```
+
+```elixir
+defmodule NumberAdjuster do
+  use GenStage
+
+  def start_link(options) do
+    GenStage.start_link(__MODULE__, [], Keyword.take(options, [:name]))
+  end
+
+  @impl true
+  def init([]) do
+    {:producer_consumer, :no_state}
+  end
+
+  @impl true
+  def handle_events(events, _from, state) do
+    new_events =
+      Enum.map(events, fn number ->
+        adjustment = number * :rand.uniform() / 10
+        Enum.random([number + adjustment, number - adjustment])
+      end)
+
+    {:noreply, new_events, state}
+  end
+end
+```
+
+```elixir
+{:ok, consumer} = Kino.start_child({EventsPrinter, name: FinalConsumer})
+{:ok, producer_consumer} = Kino.start_child({NumberAdjuster, name: MidStage})
+{:ok, producer} = Kino.start_child({NumbersProducer, start_at: 489, name: InitialProducer})
+
+{:ok, visualizer} =
+  Kino.start_child({GenStageVisualizer, stages: [producer, producer_consumer, consumer]})
+
+# Subscribe the consumer to the producer.
+GenStage.sync_subscribe(consumer, to: producer_consumer, min_demand: 2, max_demand: 5)
+GenStage.sync_subscribe(producer_consumer, to: producer, min_demand: 2, max_demand: 5)
+
+# Let this run for a couple of seconds.
+Process.sleep(2000)
+
+GenStage.stop(consumer)
+GenStage.stop(producer)
+
+GenStageVisualizer.render(visualizer)
 ```
 
 <!-- livebook:{"branch_parent_index":0} -->
 
 ## Dispatchers
 
-Broadcasting to all consumers with `GenStage.BroadcastDispatcher`:
+Let's start with a producer that uses `GenStage.BroadcastDispatcher` to **broadcast** to all its consumers:
 
 ```elixir
 defmodule PubSubProducer do
   use GenStage
 
-  def start_link do
+  def start_link([] = _opts) do
     GenStage.start_link(__MODULE__, :no_args, name: __MODULE__)
   end
 
+  @doc "Publishes messages on demand."
   def publish(message) do
     GenStage.call(__MODULE__, {:publish, message})
   end
@@ -256,14 +333,17 @@ defmodule PubSubProducer do
     {:noreply, [], state}
   end
 end
+```
 
-{:ok, consumer1} = EventsPrinter.start(name: PubSubPrinter1)
-{:ok, consumer2} = EventsPrinter.start(name: PubSubPrinter2)
-{:ok, consumer3} = EventsPrinter.start(name: PubSubPrinter3)
+```elixir
+{:ok, consumer1} = Kino.start_child({EventsPrinter, name: PubSubPrinter1})
+{:ok, consumer2} = Kino.start_child({EventsPrinter, name: PubSubPrinter2})
+{:ok, consumer3} = Kino.start_child({EventsPrinter, name: PubSubPrinter3})
 
-{:ok, pubsub} = PubSubProducer.start_link()
+{:ok, pubsub} = Kino.start_child(PubSubProducer)
 
-GenStageVisualizer.start!(producers: [pubsub], consumers: [consumer1, consumer2, consumer3])
+{:ok, visualizer} =
+  Kino.start_child({GenStageVisualizer, stages: [pubsub, consumer1, consumer2, consumer3]})
 
 # Subscribe the consumers to the producers.
 GenStage.sync_subscribe(consumer1, to: pubsub, min_demand: 2, max_demand: 8)
@@ -274,21 +354,24 @@ GenStage.sync_subscribe(consumer3, to: pubsub, min_demand: 2, max_demand: 8)
 PubSubProducer.publish("hello")
 PubSubProducer.publish("world")
 
-GenStage.stop(PubSubPrinter1)
-GenStage.stop(PubSubPrinter2)
-GenStage.stop(PubSubPrinter3)
+Process.sleep(500)
 GenStage.stop(PubSubProducer)
+Process.sleep(500)
 
-GenStageVisualizer.render()
+GenStageVisualizer.render(visualizer)
 ```
 
-Dispatching events based on partitions with `GenStage.PartitionDispatcher`:
+Other dispatchers are available.
+
+The *default* one is `GenStage.DemandDispatcher`, which dispatches to the consumer with the **most demand**, that is, the "hungriest" consumer.
+
+Another dispatcher is `GenStage.PartitionDispatcher`, which dispatches based on a configurable **partition**:
 
 ```elixir
 defmodule TypesProducer do
   use GenStage
 
-  def start_link do
+  def start_link([] = _options) do
     GenStage.start_link(__MODULE__, :no_args, name: __MODULE__)
   end
 
@@ -296,10 +379,12 @@ defmodule TypesProducer do
 
   @impl true
   def init(:no_args) do
-    dispatcher =
-      {GenStage.PartitionDispatcher, partitions: [:binaries, :floats, :integers], hash: &hash/1}
+    dispatcher_opts = [
+      partitions: [:binaries, :floats, :integers],
+      hash: &hash/1
+    ]
 
-    {:producer, :no_state, dispatcher: dispatcher}
+    {:producer, :no_state, dispatcher: {GenStage.PartitionDispatcher, dispatcher_opts}}
   end
 
   @impl true
@@ -320,12 +405,14 @@ defmodule TypesProducer do
   defp hash(float) when is_float(float), do: {float, :floats}
   defp hash(int) when is_integer(int), do: {int, :integers}
 end
+```
 
-{:ok, binary_consumer} = EventsPrinter.start(name: BinaryPrinter)
-{:ok, float_consumer} = EventsPrinter.start(name: FloatPrinter)
-{:ok, integer_consumer} = EventsPrinter.start(name: IntegerPrinter)
+```elixir
+{:ok, binary_consumer} = Kino.start_child({EventsPrinter, name: BinaryPrinter})
+{:ok, float_consumer} = Kino.start_child({EventsPrinter, name: FloatPrinter})
+{:ok, integer_consumer} = Kino.start_child({EventsPrinter, name: IntegerPrinter})
 
-{:ok, producer} = TypesProducer.start_link()
+{:ok, producer} = Kino.start_child(TypesProducer)
 
 # Subscribe the consumers to the producers.
 subscribe_opts = [to: producer, min_demand: 2, max_demand: 5]
@@ -333,9 +420,6 @@ GenStage.sync_subscribe(binary_consumer, [partition: :binaries] ++ subscribe_opt
 GenStage.sync_subscribe(float_consumer, [partition: :floats] ++ subscribe_opts)
 GenStage.sync_subscribe(integer_consumer, [partition: :integers] ++ subscribe_opts)
 
-GenStage.stop(BinaryPrinter)
-GenStage.stop(FloatPrinter)
-GenStage.stop(IntegerPrinter)
 GenStage.stop(TypesProducer)
 ```
 
@@ -347,16 +431,17 @@ GenStage.stop(TypesProducer)
 defmodule RateLimiter do
   use GenStage
 
-  def start_link do
-    GenStage.start_link(__MODULE__, :no_state)
+  def start_link(opts) do
+    GenStage.start_link(__MODULE__, opts)
   end
 
-  defstruct events: [], emitted_in_interval: 0, max_in_interval: 5
+  defstruct events: [], emitted_in_interval: 0, max_in_interval: nil
 
   @impl true
-  def init(:no_state) do
+  def init(opts) do
     :timer.send_interval(1000, self(), :reset_interval)
-    {:producer_consumer, %__MODULE__{}}
+    state = %__MODULE__{max_in_interval: Keyword.fetch!(opts, :events_per_second)}
+    {:producer_consumer, state}
   end
 
   @impl true
@@ -368,27 +453,29 @@ defmodule RateLimiter do
 
   @impl true
   def handle_info(:reset_interval, state) do
-    state = %__MODULE__{state | emitted_in_interval: 0, max_in_interval: 5}
+    state = %__MODULE__{state | emitted_in_interval: 0}
     {events_to_emit, state} = get_events_to_emit(state)
     {:noreply, events_to_emit, state}
   end
 
   defp get_events_to_emit(state) do
-    to_emit = state.max_in_interval - state.emitted_in_interval
+    case state.max_in_interval - state.emitted_in_interval do
+      to_emit when to_emit > 0 ->
+        {events, state} = get_and_update_in(state.events, &Enum.split(&1, to_emit))
+        {events, update_in(state.emitted_in_interval, &(&1 + to_emit))}
 
-    if to_emit > 0 do
-      {events, state} = get_and_update_in(state.events, &Enum.split(&1, to_emit))
-      {events, update_in(state.emitted_in_interval, &(&1 + to_emit))}
-    else
-      {[], state}
+      _ ->
+        {[], state}
     end
   end
 end
+```
 
-defmodule Fetcher do
+```elixir
+defmodule CrashDataFetcher do
   use GenStage
 
-  def start_link do
+  def start_link([] = _options) do
     GenStage.start_link(__MODULE__, :no_state)
   end
 
@@ -416,18 +503,23 @@ defmodule Fetcher do
     {:noreply, events, state}
   end
 end
+```
 
-{:ok, years_producer} = GenStage.from_enumerable(1920..2023)
-{:ok, rate_limiter} = RateLimiter.start_link()
-{:ok, fetcher} = Fetcher.start_link()
-{:ok, events_printer} = EventsPrinter.start(name: CrashesPrinter)
+```elixir
+producer_spec = %{
+  id: :years,
+  start: {GenStage, :from_enumerable, [1920..2023, [on_cancel: :stop]]}
+}
 
-GenStageVisualizer.start!(
-  producers: [years_producer, rate_limiter, fetcher],
-  consumers: [rate_limiter, fetcher, events_printer]
-)
+{:ok, years_producer} = Kino.start_child(producer_spec)
+{:ok, rate_limiter} = Kino.start_child({RateLimiter, events_per_second: 3})
+{:ok, fetcher} = Kino.start_child(CrashDataFetcher)
+{:ok, events_printer} = Kino.start_child({EventsPrinter, name: CrashesPrinter})
 
 GenStage.sync_subscribe(events_printer, to: fetcher, max_demand: 10)
 GenStage.sync_subscribe(fetcher, to: rate_limiter, max_demand: 10)
 GenStage.sync_subscribe(rate_limiter, to: years_producer, max_demand: 10, cancel: :transient)
+
+Process.sleep(5_000)
+GenStage.stop(events_printer)
 ```
