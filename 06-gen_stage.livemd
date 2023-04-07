@@ -3,7 +3,7 @@
 ```elixir
 Mix.install([
   {:gen_stage, "~> 1.0"},
-  {:kino, ">= 0.0.0"},
+  {:kino, "~> 0.9.1"},
   {:phoenix_html, "~> 3.3"},
   {:req, "~> 0.3.5"},
   {:floki, "~> 0.34.1"}
@@ -187,6 +187,22 @@ GenStageVisualizer.render(visualizer)
 
 Who knows what _**backpressure**_ is?
 
+<!-- livebook:{"break_markdown":true} -->
+
+<!-- Learn more at https://mermaid-js.github.io/mermaid -->
+
+#### Demand-driven Data Flow
+
+```mermaid
+%%{init: {'theme':'forest'}}%%
+graph LR;
+  p([Producer])
+  c([Consumer])
+
+  p --Send events as requested --> c
+  c --Ask for data by sending demand--> p
+```
+
 ## Multiple Producers and Consumers
 
 <!-- Learn more at https://mermaid-js.github.io/mermaid -->
@@ -297,11 +313,39 @@ GenStage.stop(producer)
 GenStageVisualizer.render(visualizer)
 ```
 
+<!-- Learn more at https://mermaid-js.github.io/mermaid -->
+
+The demand-driven event flow applies to producer-consumers as well:
+
+```mermaid
+%%{init: {'theme':'forest'}}%%
+graph LR;
+  p([Producer])
+  pc1([Producer-consumer 1])
+  pc2([Producer-consumer 2])
+  c([Consumer])
+
+  p --events--> pc1 --events--> pc2 --events--> c
+  c --demand--> pc2 --demand--> pc1 --demand--> p
+
+```
+
 <!-- livebook:{"branch_parent_index":0} -->
 
 ## Dispatchers
 
-Let's start with a producer that uses `GenStage.BroadcastDispatcher` to **broadcast** to all its consumers:
+`GenStage.BroadcastDispatcher` sends the **same events** to all subscribed consumers.
+
+```mermaid
+%%{init: {'theme':'forest'}}%%
+graph LR;
+  p([Producer])
+  c1([Consumer 1])
+  c2([Consumer 2])
+  c3([Consumer 3])
+
+  p --event X--> c1 & c2 & c3
+```
 
 ```elixir
 defmodule PubSubProducer do
@@ -355,7 +399,7 @@ PubSubProducer.publish("hello")
 PubSubProducer.publish("world")
 
 Process.sleep(500)
-GenStage.stop(PubSubProducer)
+Kino.terminate_child(pubsub)
 Process.sleep(500)
 
 GenStageVisualizer.render(visualizer)
@@ -365,7 +409,28 @@ Other dispatchers are available.
 
 The *default* one is `GenStage.DemandDispatcher`, which dispatches to the consumer with the **most demand**, that is, the "hungriest" consumer.
 
-Another dispatcher is `GenStage.PartitionDispatcher`, which dispatches based on a configurable **partition**:
+### Partition Dispatcher
+
+Another dispatcher is `GenStage.PartitionDispatcher`, which dispatches based on a configurable **partition**.
+
+```mermaid
+%%{init: {'theme':'forest'}}%%
+graph LR
+  p([Producer with partition dispatcher])
+
+  subgraph consumers_odd[Consumers for odd]
+    cons_odd1([Consumer])
+    cons_odd2([Consumer])
+  end
+
+  subgraph consumers_even[Consumers for even]
+    cons_even1([Consumer])
+    cons_even2([Consumer])
+  end
+  
+  p --"events for partition #quot;odd#quot;"--> consumers_odd
+  p --"events for partition #quot;even#quot;"--> consumers_even
+```
 
 ```elixir
 defmodule TypesProducer do
@@ -420,7 +485,7 @@ GenStage.sync_subscribe(binary_consumer, [partition: :binaries] ++ subscribe_opt
 GenStage.sync_subscribe(float_consumer, [partition: :floats] ++ subscribe_opts)
 GenStage.sync_subscribe(integer_consumer, [partition: :integers] ++ subscribe_opts)
 
-GenStage.stop(TypesProducer)
+Kino.terminate_child(producer)
 ```
 
 <!-- livebook:{"branch_parent_index":0} -->
@@ -521,5 +586,23 @@ GenStage.sync_subscribe(fetcher, to: rate_limiter, max_demand: 10)
 GenStage.sync_subscribe(rate_limiter, to: years_producer, max_demand: 10, cancel: :transient)
 
 Process.sleep(5_000)
-GenStage.stop(events_printer)
+Kino.terminate_child(events_printer)
+```
+
+GenStage's rate-limiting and backpressure use cases can be applied to so many other things, not just outgoing HTTP requests (see [this blog post](https://tech.forzafootball.com/blog/maximizing-http2-performance-with-genstage)).
+
+```mermaid
+%%{ init: { 'theme': 'forest' }}%%
+flowchart TD
+  p(["Producer that fetches push notifications from Cassandra"])
+  apns((APNS servers))
+
+  subgraph consumers[Consumers]
+    c1([Consumer 1]) --> http2_conn1["HTTP/2 connection"]
+    c2([Consumer 2]) --> http2_conn2["HTTP/2 connection"]
+    c3([Consumer 3]) --> http2_conn3["HTTP/2 connection"]
+  end
+
+  p --Notifications--> c1 & c2 & c3
+  http2_conn1 & http2_conn2 & http2_conn3 --"HTTP/2 requests"--> apns
 ```

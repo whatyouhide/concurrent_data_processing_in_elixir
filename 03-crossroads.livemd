@@ -1,7 +1,25 @@
 # Interval — The GenStage Crossroad
 
-## Section
+## Abstractions
 
-```elixir
+* GenStage — lower-level abstraction for data processing in stages, with backpressure
+* Broadway — abstraction to build consumer pipelines with just a few callbacks (based on GenStage)
+* Flow — abstraction to build data-processing flows (based on GenStage)
 
+<!-- livebook:{"break_markdown":true} -->
+
+<!-- Learn more at https://mermaid-js.github.io/mermaid -->
+
+```mermaid
+%%{init: {'theme':'forest'}}%%
+graph TD;
+  GenStage --> Broadway & Flow
 ```
+
+<!-- livebook:{"break_markdown":true} -->
+
+Let's go **top-down** in abstractions:
+
+1. Broadway
+2. Flow
+3. GenStage

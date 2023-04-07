@@ -4,7 +4,7 @@
 Mix.install([
   {:broadway, "~> 1.0"},
   {:req, "~> 0.3"},
-  {:kino, "~> 0.9.0"}
+  {:kino, "~> 0.9.1"}
 ])
 
 ExUnit.start(autorun: false)
@@ -73,13 +73,16 @@ defmodule SyntheticMetricsProducer do
     events =
       Stream.repeatedly(fn ->
         %Broadway.Message{
-          data: %{request_time: (:rand.normal() * 500) |> abs() |> round()},
+          data: %{
+            method: Enum.random(["GET", "POST", "PUT", "DELETE"]),
+            endpoint: Enum.random(["/posts", "/authors"]),
+            request_time: (:rand.normal() * 500) |> abs() |> round()
+          },
           acknowledger: Broadway.NoopAcknowledger.init()
         }
       end)
-      |> Enum.take(demand)
 
-    {:noreply, events, state}
+    {:noreply, Enum.take(events, demand), state}
   end
 end
 
@@ -92,6 +95,8 @@ end
 |> Enum.each(fn message ->
   assert is_integer(message.data.request_time)
 end)
+
+Kino.terminate_child(producer)
 ```
 
 Now, let's create a Broadway pipeline that consumes metrics, and for now **logs** the ones where `request_time` is greater than 500ms.
@@ -119,7 +124,7 @@ defmodule SlowRequestsPipeline do
   @impl true
   def handle_message(:default, message, _context) do
     if message.data.request_time >= 500 do
-      Logger.info("Slow request (#{message.data.request_time}ms)")
+      Logger.info("Slow request: #{inspect(message.data)}")
     end
 
     message
@@ -128,22 +133,145 @@ end
 ```
 
 ```elixir
-{:ok, pipeline} =
-  Kino.start_child(Supervisor.child_spec(SlowRequestsPipeline, restart: :temporary))
+{:ok, pipeline} = Kino.start_child(SlowRequestsPipeline)
 
 Process.sleep(2_000)
 
-:ok = Broadway.stop(pipeline, :normal, 500)
+Kino.terminate_child(pipeline)
 ```
 
 Wanna see the topology of a Broadway supervision tree? 😎
 
 ```elixir
-{:ok, pipeline} =
-  Kino.start_child(Supervisor.child_spec(SlowRequestsPipeline, restart: :temporary))
+{:ok, pipeline} = Kino.start_child(SlowRequestsPipeline)
 
 # Internal API - DO NOT USE!
 Kino.Process.render_sup_tree(:sys.get_state(pipeline).supervisor_pid, direction: :left_right)
 
-:ok = Broadway.stop(pipeline, :normal, 500)
+Kino.terminate_child(pipeline)
+```
+
+## Batching
+
+* Batch messages based on their properties.
+* Process batches once they reach a **maximum size**, or a **timeout** expires.
+
+<!-- livebook:{"break_markdown":true} -->
+
+<!-- Learn more at https://mermaid-js.github.io/mermaid -->
+
+```mermaid
+%%{init: {'theme':'forest'}}%%
+flowchart TD
+  subgraph Producers
+    prod1([Producer 1])
+    prod2([Producer 2])
+  end
+
+  subgraph Processors
+    proc1([Processor 1])
+    proc2([Processor 2])
+    proc3([Processor 3])
+  end
+
+  subgraph Batchers
+    batcher_get([Batcher_GET])
+    batcher_post([Batcher_POST])
+    batcher_other([Batcher_other])
+  end
+
+  subgraph Batcher Processors
+    batcher_get_proc1([Batcher_GET Processor 1])
+    batcher_get_proc2([Batcher_GET Processor 2])
+    batcher_other_proc1([Batcher_other Processor 1])
+    batcher_other_proc2([Batcher_other Processor 2])
+  end
+
+  prod1 & prod2 --> proc1 & proc2 & proc3
+  Processors --> batcher_get & batcher_post & batcher_other
+
+  batcher_get --> batcher_get_proc1 & batcher_get_proc2
+  batcher_other --> batcher_other_proc1 & batcher_other_proc2
+```
+
+<!-- livebook:{"break_markdown":true} -->
+
+Let's implement a Broadway pipeline that aggregates requests and then sends the slowest requests down to a metrics provider (think [AppSignal](https://www.appsignal.com/) or [New Relic](https://newrelic.com/)).
+
+```elixir
+defmodule RequestsAggregatorPipeline do
+  use Broadway
+
+  require Logger
+
+  def start_link([] = _opts) do
+    Broadway.start_link(__MODULE__,
+      name: __MODULE__,
+      producer: [
+        module: {SyntheticMetricsProducer, []},
+        concurrency: 2,
+        rate_limiting: [allowed_messages: 1000, interval: 1_000]
+      ],
+      processors: [
+        default: [concurrency: 3]
+      ],
+      batchers: [
+        GET: [
+          batch_size: 1_000,
+          batch_timeout: 500,
+          concurrency: 1
+        ],
+        POST: [
+          batch_size: 100,
+          batch_timeout: 500,
+          concurrency: 1
+        ],
+        other: [
+          batch_size: 500,
+          batch_timeout: 500,
+          concurrency: 1
+        ]
+      ]
+    )
+  end
+
+  @impl true
+  def handle_message(:default, message, _context) do
+    case message.data.method do
+      "GET" -> Broadway.Message.put_batcher(message, :GET)
+      "POST" -> Broadway.Message.put_batcher(message, :POST)
+      _other -> Broadway.Message.put_batcher(message, :other)
+    end
+  end
+
+  @impl true
+  def handle_batch(batcher, messages, batch_info, _context) do
+    slowest = Enum.max_by(messages, & &1.data.request_time)
+
+    Logger.info(
+      "Slowest request in #{inspect(batcher)} batch (out of #{batch_info.size}): #{inspect(slowest.data)}"
+    )
+
+    messages
+  end
+end
+```
+
+```elixir
+{:ok, pipeline} = Kino.start_child(RequestsAggregatorPipeline)
+
+Process.sleep(2_000)
+
+Kino.terminate_child(pipeline)
+```
+
+Let's look at the new supervision tree.
+
+```elixir
+{:ok, pipeline} = Kino.start_child(RequestsAggregatorPipeline)
+
+# Internal API - DO NOT USE!
+Kino.Process.render_sup_tree(:sys.get_state(pipeline).supervisor_pid)
+
+Kino.terminate_child(pipeline)
 ```
