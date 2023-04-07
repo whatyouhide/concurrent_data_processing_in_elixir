@@ -242,8 +242,8 @@ flowchart TD;
 
 Process.sleep(1000)
 
-GenStage.stop(producer1)
-GenStage.stop(producer2)
+Kino.terminate_child(producer1)
+Kino.terminate_child(producer2)
 
 GenStageVisualizer.render(visualizer)
 ```
@@ -307,8 +307,8 @@ GenStage.sync_subscribe(producer_consumer, to: producer, min_demand: 2, max_dema
 # Let this run for a couple of seconds.
 Process.sleep(2000)
 
-GenStage.stop(consumer)
-GenStage.stop(producer)
+Kino.terminate_child(consumer)
+Kino.terminate_child(producer)
 
 GenStageVisualizer.render(visualizer)
 ```
