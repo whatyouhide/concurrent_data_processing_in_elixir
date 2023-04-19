@@ -142,7 +142,19 @@ max_dollar = 100_000
 
 data_for_histogram =
   Helpers.timed("Reading CSVs", row_count, fn ->
-    raise "to be implemented"
+    csv_paths
+    |> Stream.map(fn file -> file |> File.stream!() |> Stream.drop(1) end)
+    |> Stream.concat()
+    |> NimbleCSV.RFC4180.parse_stream(skip_headers: false)
+    |> Stream.map(fn [_id, _name, _pledged, goal] ->
+      if :rand.uniform() < 0.005, do: Process.sleep(1)
+      div(round(String.to_float(goal)), bucket_size) * bucket_size
+    end)
+    |> Stream.filter(fn bucket -> bucket <= max_dollar end)
+    |> Enum.reduce(%{}, fn bucket, acc -> Map.update(acc, bucket, 1, &(&1 + 1)) end)
+    |> Enum.map(fn {bucket, count} ->
+      %{bucket_start: bucket, bucket_end: bucket + bucket_size, count: count}
+    end)
   end)
 
 Helpers.plot_histogram(data_for_histogram, bucket_size)
@@ -164,7 +176,21 @@ max_dollar = 100_000
 
 data_for_histogram =
   Helpers.timed("Reading CSVs", row_count, fn ->
-    raise "to be implemented"
+    csv_paths
+    |> Enum.map(fn file ->
+      file |> File.stream!() |> NimbleCSV.RFC4180.parse_stream(skip_headers: true)
+    end)
+    |> Flow.from_enumerables(stages: 8)
+    |> Flow.map(fn [_id, _name, _pledged, goal] ->
+      if :rand.uniform() < 0.005, do: Process.sleep(1)
+      div(round(String.to_float(goal)), bucket_size) * bucket_size
+    end)
+    |> Flow.filter(fn bucket -> bucket <= max_dollar end)
+    |> Flow.partition()
+    |> Flow.reduce(fn -> %{} end, fn bucket_start, acc ->
+      Map.update(acc, bucket_start, 1, &(&1 + 1))
+    end)
+    |> Map.new()
   end)
 
 data_for_histogram =
@@ -173,6 +199,12 @@ data_for_histogram =
   end
 
 Helpers.plot_histogram(data_for_histogram, bucket_size)
+```
+
+```elixir
+File.stream!(Enum.at(csv_paths, 0))
+|> NimbleCSV.RFC4180.parse_stream()
+|> Enum.take(1)
 ```
 
 ```mermaid

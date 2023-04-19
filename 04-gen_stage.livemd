@@ -122,20 +122,28 @@ defmodule NumbersProducer do
 
   @impl true
   def init(counter) do
-    raise "to be implemented"
+    {:producer, counter}
   end
 
   @impl true
   def handle_demand(demand, counter) when demand > 0 do
-    raise "to be implemented"
+    demand = Enum.random([demand, demand - 2, demand + 2])
+    events = Enum.to_list(counter..(counter + demand - 1))
+    {:noreply, events, counter + demand}
   end
 end
+```
+
+```elixir
+{:ok, producer} = NumbersProducer.start_link(start_at: 10, name: TestProducer)
+stream = GenStage.stream([{producer, []}])
+Enum.take(stream, 10)
 ```
 
 A consumer that prints the events it consumes:
 
 ```elixir
-# A consumer that prints the events it consumes. 
+# A consumer that prints the events it consumes.
 defmodule EventsPrinter do
   use GenStage
 
@@ -146,12 +154,14 @@ defmodule EventsPrinter do
 
   @impl true
   def init(name) do
-    raise "to be implemented"
+    {:consumer, %{name: name}}
   end
 
   @impl true
-  def handle_events(events, {consumer, _ref} = _from, state) do
-    raise "to be implemented"
+  def handle_events(events, {producer, _ref} = _from, state) do
+    Process.sleep(500)
+    IO.inspect(events, label: "Events from #{inspect(producer)} in #{state.name}")
+    {:noreply, [], state}
   end
 end
 ```
@@ -266,12 +276,19 @@ defmodule NumberAdjuster do
 
   @impl true
   def init([]) do
-    raise "to be implemented"
+    {:producer_consumer, :no_state}
   end
 
   @impl true
   def handle_events(events, _from, state) do
-    raise "to be implemented"
+    new_events =
+      Enum.map(events, fn number ->
+        # number * :rand.uniform() / 10
+        adjustment = 0
+        Enum.random([number - adjustment, number + adjustment])
+      end)
+
+    {:noreply, new_events, state}
   end
 end
 ```
@@ -285,8 +302,8 @@ end
   Kino.start_child({GenStageVisualizer, stages: [producer, producer_consumer, consumer]})
 
 # Subscribe the consumer to the producer.
-GenStage.sync_subscribe(consumer, to: producer_consumer, min_demand: 2, max_demand: 5)
 GenStage.sync_subscribe(producer_consumer, to: producer, min_demand: 2, max_demand: 5)
+GenStage.sync_subscribe(consumer, to: producer_consumer, min_demand: 2, max_demand: 5)
 
 # Let this run for a couple of seconds.
 Process.sleep(2000)
@@ -411,7 +428,7 @@ graph LR
     cons_even1([Consumer])
     cons_even2([Consumer])
   end
-  
+
   p --"events for partition #quot;odd#quot;"--> consumers_odd
   p --"events for partition #quot;even#quot;"--> consumers_even
 ```
@@ -485,25 +502,44 @@ defmodule RateLimiter do
   end
 
   # TODO: Fill in
-  defstruct []
+  defstruct [:max_in_interval, emitted_in_interval: 0, buffer: []]
 
   @impl true
   def init(opts) do
-    raise "to be implemented"
+    :timer.send_interval(1000, self(), :reset_interval)
+    {:producer_consumer, %__MODULE__{max_in_interval: Keyword.fetch!(opts, :events_per_second)}}
   end
 
   @impl true
   def handle_events(events, _from, state) do
-    raise "to be implemented"
+    state = update_in(state.buffer, fn buffer -> buffer ++ events end)
+    {events_to_emit, state} = get_events_to_emit(state)
+    {:noreply, events_to_emit, state}
   end
 
   @impl true
   def handle_info(:reset_interval, state) do
-    raise "to be implemented"
+    state = %__MODULE__{state | emitted_in_interval: 0}
+    {events_to_emit, state} = get_events_to_emit(state)
+    {:noreply, events_to_emit, state}
   end
 
   defp get_events_to_emit(state) do
-    raise "to be implemented"
+    case state.max_in_interval - state.emitted_in_interval do
+      to_emit when to_emit > 0 ->
+        {events_to_emit, events_to_buffer} = Enum.split(state.buffer, to_emit)
+
+        state = %__MODULE__{
+          state
+          | buffer: events_to_buffer,
+            emitted_in_interval: state.emitted_in_interval + length(events_to_emit)
+        }
+
+        {events_to_emit, state}
+
+      _ ->
+        {[], state}
+    end
   end
 end
 ```
@@ -525,7 +561,7 @@ defmodule CrashDataFetcher do
   def handle_events(events, _from, state) do
     events =
       Enum.flat_map(events, fn year ->
-        response = Req.get!("http://www.planecrashinfo.com/#{year}/#{year}.htm")
+        response = Req.get!("https://www.planecrashinfo.com/#{year}/#{year}.htm")
         html_doc = Floki.parse_document!(response.body)
 
         {[header], table_rows} =
@@ -543,9 +579,13 @@ end
 ```
 
 ```elixir
+Req.get!("https://www.planecrashinfo.com/1920/1920.htm")
+```
+
+```elixir
 producer_spec = %{
   id: :years,
-  start: {GenStage, :from_enumerable, [1920..2023, [on_cancel: :stop]]}
+  start: {GenStage, :from_enumerable, [1940..2023, [on_cancel: :stop]]}
 }
 
 {:ok, years_producer} = Kino.start_child(producer_spec)

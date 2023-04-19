@@ -19,8 +19,6 @@ import ExUnit.Assertions
 
 The goal of Broadway is to simplify data processing pipelines by providing the right abstractions
 
-Does anybody know why it's called *Broadway*?
-
 ### Broadway Components
 
 These are components that make up a Broadway pipeline:
@@ -115,7 +113,7 @@ defmodule SlowRequestsPipeline do
       name: __MODULE__,
       producer: [
         module: {SyntheticMetricsProducer, []},
-        concurrency: 1,
+        concurrency: 3,
         rate_limiting: [allowed_messages: 10, interval: 100]
       ],
       processors: [
@@ -126,7 +124,7 @@ defmodule SlowRequestsPipeline do
   end
 
   @impl true
-  def handle_message(:default, message, %{chart: chart}) do
+  def handle_message(:default, %Broadway.Message{} = message, _context = %{chart: chart}) do
     if message.data.request_time >= 500 do
       Logger.info("Slow request: #{inspect(message.data)}")
 
@@ -166,7 +164,7 @@ Kino.terminate_child(pipeline)
 Wanna see the topology of a Broadway supervision tree? 😎
 
 ```elixir
-{:ok, pipeline} = Kino.start_child(SlowRequestsPipeline)
+{:ok, pipeline} = Kino.start_child({SlowRequestsPipeline, chart: chart})
 
 # Internal API - DO NOT USE!
 Kino.Process.render_sup_tree(:sys.get_state(pipeline).supervisor_pid, direction: :left_right)
@@ -242,7 +240,7 @@ defmodule RequestsAggregatorPipeline do
         GET: [
           batch_size: 1_000,
           batch_timeout: 500,
-          concurrency: 1
+          concurrency: 3
         ],
         POST: [
           batch_size: 100,
