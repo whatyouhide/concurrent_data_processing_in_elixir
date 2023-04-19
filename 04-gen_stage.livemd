@@ -122,15 +122,12 @@ defmodule NumbersProducer do
 
   @impl true
   def init(counter) do
-    {:producer, counter}
+    raise "to be implemented"
   end
 
   @impl true
   def handle_demand(demand, counter) when demand > 0 do
-    # If the counter is 3 and we ask for 2 items, we will
-    # emit the items 3 and 4, and set the state to 5.
-    events = Enum.to_list(counter..(counter + demand - 1))
-    {:noreply, events, counter + demand}
+    raise "to be implemented"
   end
 end
 ```
@@ -149,19 +146,12 @@ defmodule EventsPrinter do
 
   @impl true
   def init(name) do
-    {:consumer, %{name: name}}
+    raise "to be implemented"
   end
 
   @impl true
   def handle_events(events, {consumer, _ref} = _from, state) do
-    # Artificial delay.
-    Process.sleep(500)
-
-    # Inspect the events.
-    IO.inspect(events, label: "Events from #{inspect(consumer)} in #{inspect(state.name)}")
-
-    # We are a consumer, so we would never emit items.
-    {:noreply, [], state}
+    raise "to be implemented"
   end
 end
 ```
@@ -276,18 +266,12 @@ defmodule NumberAdjuster do
 
   @impl true
   def init([]) do
-    {:producer_consumer, :no_state}
+    raise "to be implemented"
   end
 
   @impl true
   def handle_events(events, _from, state) do
-    new_events =
-      Enum.map(events, fn number ->
-        adjustment = number * :rand.uniform() / 10
-        Enum.random([number + adjustment, number - adjustment])
-      end)
-
-    {:noreply, new_events, state}
+    raise "to be implemented"
   end
 end
 ```
@@ -500,38 +484,26 @@ defmodule RateLimiter do
     GenStage.start_link(__MODULE__, opts)
   end
 
-  defstruct events: [], emitted_in_interval: 0, max_in_interval: nil
+  # TODO: Fill in
+  defstruct []
 
   @impl true
   def init(opts) do
-    :timer.send_interval(1000, self(), :reset_interval)
-    state = %__MODULE__{max_in_interval: Keyword.fetch!(opts, :events_per_second)}
-    {:producer_consumer, state}
+    raise "to be implemented"
   end
 
   @impl true
   def handle_events(events, _from, state) do
-    state = update_in(state.events, &(&1 ++ events))
-    {events_to_emit, state} = get_events_to_emit(state)
-    {:noreply, events_to_emit, state}
+    raise "to be implemented"
   end
 
   @impl true
   def handle_info(:reset_interval, state) do
-    state = %__MODULE__{state | emitted_in_interval: 0}
-    {events_to_emit, state} = get_events_to_emit(state)
-    {:noreply, events_to_emit, state}
+    raise "to be implemented"
   end
 
   defp get_events_to_emit(state) do
-    case state.max_in_interval - state.emitted_in_interval do
-      to_emit when to_emit > 0 ->
-        {events, state} = get_and_update_in(state.events, &Enum.split(&1, to_emit))
-        {events, update_in(state.emitted_in_interval, &(&1 + to_emit))}
-
-      _ ->
-        {[], state}
-    end
+    raise "to be implemented"
   end
 end
 ```

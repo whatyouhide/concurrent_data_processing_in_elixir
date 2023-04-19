@@ -4,7 +4,8 @@
 Mix.install([
   {:broadway, "~> 1.0"},
   {:req, "~> 0.3"},
-  {:kino, "~> 0.9.1"}
+  {:kino, "~> 0.9.1"},
+  {:kino_vega_lite, "~> 0.1.8"}
 ])
 
 ExUnit.start(autorun: false)
@@ -107,24 +108,32 @@ defmodule SlowRequestsPipeline do
 
   require Logger
 
-  def start_link([] = _opts) do
+  def start_link(opts) do
+    chart = Keyword.fetch!(opts, :chart)
+
     Broadway.start_link(__MODULE__,
       name: __MODULE__,
       producer: [
         module: {SyntheticMetricsProducer, []},
         concurrency: 1,
-        rate_limiting: [allowed_messages: 10, interval: 1_000]
+        rate_limiting: [allowed_messages: 10, interval: 100]
       ],
       processors: [
         default: [concurrency: 2]
-      ]
+      ],
+      context: %{chart: chart}
     )
   end
 
   @impl true
-  def handle_message(:default, message, _context) do
+  def handle_message(:default, message, %{chart: chart}) do
     if message.data.request_time >= 500 do
       Logger.info("Slow request: #{inspect(message.data)}")
+
+      Kino.VegaLite.push(chart, %{
+        time: System.system_time(:millisecond),
+        request_time: message.data.request_time
+      })
     end
 
     message
@@ -133,9 +142,23 @@ end
 ```
 
 ```elixir
-{:ok, pipeline} = Kino.start_child(SlowRequestsPipeline)
+alias VegaLite, as: VL
 
-Process.sleep(2_000)
+chart =
+  VL.new(width: 800, height: 400)
+  |> VL.mark(:line)
+  |> VL.encode_field(:x, "time",
+    title: "Time",
+    type: :temporal,
+    time_unit: "hoursminutessecondsmilliseconds"
+  )
+  |> VL.encode_field(:y, "request_time", title: "Request time (ms)", type: :quantitative)
+  |> Kino.VegaLite.new()
+  |> Kino.render()
+
+{:ok, pipeline} = Kino.start_child({SlowRequestsPipeline, chart: chart})
+
+Process.sleep(5_000)
 
 Kino.terminate_child(pipeline)
 ```

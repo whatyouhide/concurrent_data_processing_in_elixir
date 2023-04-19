@@ -3,8 +3,8 @@
 ## Abstractions
 
 * GenStage — lower-level abstraction for data processing in stages, with backpressure
-* Broadway — abstraction to build consumer pipelines with just a few callbacks (based on GenStage)
 * Flow — abstraction to build data-processing flows (based on GenStage)
+* Broadway — abstraction to build consumer pipelines with just a few callbacks (based on GenStage)
 
 <!-- livebook:{"break_markdown":true} -->
 
@@ -18,8 +18,8 @@ graph TD;
 
 <!-- livebook:{"break_markdown":true} -->
 
-Let's go **top-down** in abstractions:
+Let's go **bottom-up** in abstractions:
 
-1. Broadway
+1. GenStage
 2. Flow
-3. GenStage
+3. Broadway
